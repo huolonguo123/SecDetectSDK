@@ -142,6 +142,7 @@ sec::BaseDetector* sec_make_vm_detector();
 sec::BaseDetector* sec_make_repack_detector();
 sec::BaseDetector* sec_make_bootloader_detector();
 sec::BaseDetector* sec_make_usb_detector();
+sec::BaseDetector* sec_make_module_detector();
 }
 
 #endif /* SECDETECT_INTERNAL_H */

@@ -30,6 +30,7 @@ struct Registry {
         items.push_back(sec_make_repack_detector());
         items.push_back(sec_make_bootloader_detector());
         items.push_back(sec_make_usb_detector());
+        items.push_back(sec_make_module_detector());
     }
     ~Registry() {
         for (BaseDetector* d : items) delete d;

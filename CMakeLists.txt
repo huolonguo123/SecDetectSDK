@@ -40,6 +40,7 @@ set(SDK_SOURCES
     src/det_repack.cpp
     src/det_bootloader.cpp
     src/det_usb.cpp
+    src/det_module.cpp
     src/tee_stub.cpp
 )
 

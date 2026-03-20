@@ -40,7 +40,7 @@ const Item kItems[] = {
     {DETECT_FRIDA, "frida"},       {DETECT_XPOSED, "xposed"},
     {DETECT_EMULATOR, "emulator"}, {DETECT_VM, "vm"},
     {DETECT_REPACK, "repack"},     {DETECT_BOOTLOADER, "bootloader"},
-    {DETECT_USB_DEBUG, "usb_debug"},
+    {DETECT_USB_DEBUG, "usb_debug"}, {DETECT_MODULE, "module"},
 };
 
 int parse_type(const char* s) {
@@ -49,7 +49,7 @@ int parse_type(const char* s) {
         if (strcmp(s, it.name) == 0) return it.type;
     char* end = nullptr;
     long v = strtol(s, &end, 10);
-    if (end && *end == '\0' && v >= 1 && v <= 9) return (int)v;
+    if (end && *end == '\0' && v >= 1 && v <= 10) return (int)v;
     return -1;
 }
 

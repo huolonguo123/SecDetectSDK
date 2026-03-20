@@ -1,6 +1,6 @@
 # SecDetectSDK
 
-Android 客户端安全检测 SDK(C/C++)。在 App 进程内做 9 项风险检测:Root、调试器、Frida、Xposed、模拟器、虚拟机/双开、重打包、Bootloader 解锁、USB 调试。
+Android 客户端安全检测 SDK(C/C++)。在 App 进程内做 10 项风险检测:Root、调试器、Frida、Xposed、模拟器、虚拟机/双开、重打包、Bootloader 解锁、USB 调试、非白名单模块注入。
 
 对外暴露纯 C ABI,单函数入口,可集成进 Android App,也可用附带的命令行工具单独运行。
 
@@ -17,6 +17,7 @@ Android 客户端安全检测 SDK(C/C++)。在 App 进程内做 9 项风险检�
 | 7 | 重打包 | APK v1 签名指纹比对(内置 ZIP 解析) |
 | 8 | Bootloader | AVB 状态属性(verifiedbootstate 等) |
 | 9 | USB 调试 | usb config / adb 使能状态 |
+| 10 | 模块注入 | 可执行模块白名单差分(非系统/非自身 so) |
 
 所有检测为用户态旁证,单项均可被针对性绕过,适合组合使用。
 
@@ -26,7 +27,7 @@ Android 客户端安全检测 SDK(C/C++)。在 App 进程内做 9 项风险检�
 int secdetect(int detect_type, const char* input, char* output, size_t output_len);
 ```
 
-- `detect_type`:检测项编号 1-9,`DETECT_ALL(0x7F)` 全扫
+- `detect_type`:检测项编号 1-10,`DETECT_ALL(0x7F)` 全扫
 - `input`:只读入参;仅重打包检测(7)需要,传 APK 路径,其余传 NULL
 - `output`:调用方分配的缓冲区,SDK 只写不分配
 - `output_len`:缓冲区长度,超长自动截断

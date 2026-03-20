@@ -39,6 +39,7 @@ typedef enum {
     DETECT_REPACK     = 7,  /* 重打包破解:APK 签名指纹比对(需 input 传 APK)      */
     DETECT_BOOTLOADER = 8,  /* Bootloader 解锁                                    */
     DETECT_USB_DEBUG  = 9,  /* USB 调试开关 / 网络 adb                            */
+    DETECT_MODULE     = 10, /* 非白名单可执行模块(进程内 maps 白名单差分)        */
     DETECT_ALL        = 0x7F /* 全套扫描(忽略 input)                             */
 } sec_detect_type_t;
 
