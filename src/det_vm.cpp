@@ -26,8 +26,10 @@ public:
     const char* name() const override { return "vm"; }
     int type() const override { return DETECT_VM; }
 
-    bool run(const char*, Findings& f) override {
+    bool run(const char* input, Findings& f) override {
         bool risk = false;
+        int pid = util::target_pid(input);   /* input="pid:N" 扫目标进程,空=自己 */
+        const char* who = (pid > 0) ? "vm[pid]:" : "vm:";
 
         /* 1) VM 形态 prop(先读一次,再对每个厂商名匹配) */
         std::string hw = util::get_prop("ro.hardware");
@@ -43,7 +45,7 @@ public:
             }
         }
 
-        /* 2) 双开容器:自身进程被宿主加载的痕迹(maps 路径关键词) */
+        /* 2) 双开容器:目标进程被宿主加载的痕迹(maps 路径关键词) */
         static const char* host_kw[] = {
             "virtualapp", "com.lody.virtual",  // VirtualApp
             "tai-chi", "taichi",               // 太极
@@ -51,8 +53,8 @@ public:
             "multi-app", "miui.multi",         // MIUI 分身
         };
         for (const char* k : host_kw) {
-            if (util::self_maps_path_contains(k)) {
-                f.add("maps: virtual host '%s'", k);
+            if (util::maps_path_contains(pid, k)) {
+                f.add("%s maps: virtual host '%s'", who, k);
                 risk = true;
             }
         }

@@ -25,13 +25,15 @@ public:
     const char* name() const override { return "debugger"; }
     int type() const override { return DETECT_DEBUGGER; }
 
-    bool run(const char*, Findings& f) override {
+    bool run(const char* input, Findings& f) override {
         bool risk = false;
+        int pid = util::target_pid(input);   /* input="pid:N" 扫目标进程,空=自己 */
+        const char* who = (pid > 0) ? "debugger[pid]:" : "debugger:";
 
         /* 1) 内核记账:TracerPid 非 0 = 此刻正被某个进程 ptrace */
-        int tp = util::tracer_pid();
+        int tp = util::tracer_pid_of(pid);
         if (tp > 0) {
-            f.add("ptrace: TracerPid=%d", tp);
+            f.add("%s ptrace: TracerPid=%d", who, tp);
             risk = true;
         }
 

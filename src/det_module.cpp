@@ -2,32 +2,31 @@
  * det_module.cpp — 检测项 10:非白名单可执行模块(白名单差分)
  *
  * 与 frida/xposed 的"黑名单关键词"思路相反:这里不认识任何
- * 可疑名字,而是列出自身进程所有可执行映射,与"合法集合"
- * 做差分——不在系统库目录、也不属于自身的可执行文件 = 可疑。
+ * 可疑名字,而是列出进程所有可执行映射,与"合法集合"做差分。
  * 注入者把 so 改名成 libhappy.so、拷到任意目录都绕不掉
- * "这个代码不是我 APK 里的"这一事实。
+ * "这个代码不是已安装 App/系统的"这一事实。
  *
- * 合法集合:
+ * 检测目标:input 传 "pid:1234" 扫别的进程(需 root/同 uid,
+ * SELinux 会挡跨 uid 读 /proc);不传/传空 = 扫自己。
+ *
+ * 合法集合(白名单):
  *   1) 系统目录:/system /apex /vendor /odm /product,
  *      以及 /data/dalvik-cache(App 进程必映射 boot.oat,系统生成);
- *   2) 自身模块(so 形态,路径含 "/lib/"):白名单 = 整个 App
- *      安装目录前缀 —— 该目录下 lib/ 与 oat/ 都是自己 APK
- *      解压/编译的产物;
- *   3) 自身模块(exe 形态,runner):精确白名单自身这一个文件。
+ *   2) /data/app/ 前缀:所有已安装 App 的 native lib 与 oat
+ *      都从这里加载 —— 对任意目标进程这都是"正常的 so 来源";
+ *   3) 目标进程主程序 exe(读 /proc/<pid>/exe),精确白名单。
  *
  * 局限(面试要能讲):
  *   - 只看得到"有路径名"的映射;纯匿名内存加载(mmap 匿名 +
  *     写代码再执行)在 maps 里是 [anon:...],无路径可查,要
  *     opcode/特征扫描兜底;
- *   - 路径白名单假设系统目录可信;root 往 /system 塞 so 可绕,
- *     产品要对关键目录叠哈希/签名(即上 TEE 的那部分);
- *   - 只查自身进程:真实 App 场景 = SDK 集成进被保护 App 后
- *     查自己,这正是交付 libsecsdk.so 而不是 runner 的原因。
+ *   - 路径白名单假设系统目录与 /data/app 可信;root 往 /system
+ *     或已装 App 目录塞 so 可绕,产品要对关键目录叠哈希/签名
+ *     (即上 TEE 的那部分);
+ *   - 扫别人进程需要 root:App 沙盒内只能查自己,这正是 SDK
+ *     集成进被保护 App 后查自身 maps 的产品形态。
  */
 #include "internal.h"
-
-#include <dlfcn.h>
-#include <unistd.h>
 
 namespace sec {
 
@@ -37,39 +36,17 @@ bool has_exec(const char* perms) {
     return perms && strchr(perms, 'x') != nullptr;
 }
 
-bool is_system_path(const std::string& p) {
-    static const char* kSys[] = {
+bool is_trusted_path(const std::string& p, const std::string& exe) {
+    static const char* kTrusted[] = {
         "/system/", "/apex/", "/vendor/", "/odm/", "/product/",
-        "/data/dalvik-cache/",
+        "/data/dalvik-cache/",   /* boot.oat 等系统编译产物 */
+        "/data/app/",            /* 已安装 App 的 lib/oat 加载点 */
     };
-    for (const char* s : kSys)
+    for (const char* s : kTrusted)
         if (p.compare(0, strlen(s), s) == 0) return true;
+    /* 目标主程序自身(eg: runner 在 /data/local/tmp 下跑,它自己得白) */
+    if (!exe.empty() && p == exe) return true;
     return false;
-}
-
-/* 本检测代码所在模块的绝对路径:库形态 = libsecsdk.so,
- * runner 形态 = 可执行文件本身(dladdr 按地址范围定位对象)。 */
-std::string self_module_path() {
-    Dl_info di;
-    if (dladdr(reinterpret_cast<void*>(&sec_make_module_detector), &di) &&
-        di.dli_fname && di.dli_fname[0] == '/') {
-        return di.dli_fname;
-    }
-    char buf[512];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        return buf;
-    }
-    return {};
-}
-
-bool is_own(const std::string& p, const std::string& own,
-            const std::string& own_prefix) {
-    if (own.empty()) return false;
-    if (!own_prefix.empty())
-        return p.compare(0, own_prefix.size(), own_prefix) == 0;
-    return p == own;   /* exe 形态:只白自身一个文件 */
 }
 
 }  // namespace
@@ -79,20 +56,16 @@ public:
     const char* name() const override { return "module"; }
     int type() const override { return DETECT_MODULE; }
 
-    bool run(const char*, Findings& f) override {
-        std::string maps;
-        if (!util::read_small_file("/proc/self/maps", maps)) {
-            f.add("module: cannot read /proc/self/maps");
+    bool run(const char* input, Findings& f) override {
+        int pid = util::target_pid(input);
+        std::string maps = util::maps_of(pid);
+        if (maps.empty()) {
+            f.add("module: cannot read maps for pid %d "
+                  "(need root to scan other processes)", pid);
             return false;
         }
-
-        /* 自身定位:so 形态(路径含 /lib/)→ 白整个 App 安装目录
-         * (lib 与 oat 都是自己 APK 的产物);exe 形态 → 白一个文件 */
-        std::string own = self_module_path();
-        std::string own_prefix;
-        size_t lib = own.find("/lib/");
-        if (lib != std::string::npos)
-            own_prefix = own.substr(0, lib + 1);   /* ".../<pkg>/" */
+        std::string exe = util::exe_of(pid);
+        const char* who = (pid > 0) ? "module[pid]:" : "module:";
 
         bool risk = false;
         const char* p = maps.c_str();
@@ -125,10 +98,9 @@ public:
             if (d != std::string::npos) path.erase(d);
             if (path.empty() || path[0] == '[') continue;   /* [anon:..]/[vdso] */
 
-            if (is_system_path(path) || is_own(path, own, own_prefix))
-                continue;
+            if (is_trusted_path(path, exe)) continue;
 
-            f.add("module: unexpected exec map: %s", path.c_str());
+            f.add("%s unexpected exec map: %s", who, path.c_str());
             risk = true;
         }
         return risk;

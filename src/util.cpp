@@ -64,17 +64,72 @@ bool read_small_file(const char* path, std::vector<uint8_t>& out) {
     return true;
 }
 
-/* ================= /proc/self/status:TracerPid ================= */
+/* ================= /proc/<pid>/... 目标进程取证 =================
+ * pid <= 0 一律表示"自己"(/proc/self)——runner / App 集成默认;
+ * pid > 0 读 /proc/<pid>/...:扫描别的进程需要 root 或同 uid,
+ * App 沙盒默认被 SELinux 挡。检测 input 形如 "pid:1234"。       */
 
-int tracer_pid() {
+static std::string proc_file(int pid, const char* leaf) {
+    char buf[64];
+    if (pid <= 0) snprintf(buf, sizeof buf, "/proc/self/%s", leaf);
+    else          snprintf(buf, sizeof buf, "/proc/%d/%s", pid, leaf);
+    return buf;
+}
+
+int target_pid(const char* input) {
+    if (input && strncmp(input, "pid:", 4) == 0) return atoi(input + 4);
+    return 0;
+}
+
+int tracer_pid_of(int pid) {
     std::string s;
-    if (!read_small_file("/proc/self/status", s)) return 0;
+    if (!read_small_file(proc_file(pid, "status").c_str(), s)) return 0;
     /* 行格式:"TracerPid:\t1234\n" */
     const char* p = strstr(s.c_str(), "TracerPid:");
     if (!p) return 0;
     p += strlen("TracerPid:");
     while (*p == ' ' || *p == '\t') ++p;
     return atoi(p);
+}
+
+std::string exe_of(int pid) {
+    std::string link = proc_file(pid, "exe");
+    char buf[512];
+    ssize_t n = readlink(link.c_str(), buf, sizeof(buf) - 1);
+    if (n <= 0) return {};
+    buf[n] = '\0';
+    return buf;
+}
+
+std::string maps_of(int pid) {
+    std::string s;
+    if (!read_small_file(proc_file(pid, "maps").c_str(), s)) return {};
+    return s;
+}
+
+bool maps_path_contains(int pid, const char* keyword) {
+    std::string s = maps_of(pid);
+    if (s.empty()) return false;
+    const char* p = s.c_str();
+    while (p && *p) {
+        const char* eol = strchr(p, '\n');
+        std::string line(p, eol ? eol - p : strlen(p));
+        /* 行:start-end perms offset dev inode pathname
+         * 跳 5 个空白分隔字段,剩下的整段是 pathname(可能含空格) */
+        int fields = 0;
+        const char* t = line.c_str();
+        while (fields < 5) {
+            while (*t == ' ') ++t;
+            if (!*t) break;
+            t = strchr(t, ' ');
+            if (!t) break;
+            ++fields;
+        }
+        while (*t == ' ') ++t;
+        if (*t && strstr(t, keyword)) return true;
+        p = eol ? eol + 1 : nullptr;
+    }
+    return false;
 }
 
 /* ================= /proc/net/tcp:端口监听 ================= */
@@ -144,62 +199,6 @@ bool any_process_cmdline_contains(const char* keyword) {
     }
     closedir(d);
     return hit;
-}
-
-/* ================= /proc/self/maps ================= */
-
-bool self_maps_path_contains(const char* keyword) {
-    std::string s;
-    if (!read_small_file("/proc/self/maps", s)) return false;
-    const char* p = s.c_str();
-    while (p && *p) {
-        const char* eol = strchr(p, '\n');
-        std::string line(p, eol ? eol - p : strlen(p));
-        /* 行:start-end perms offset dev inode pathname
-         * 跳 5 个空白分隔字段,剩下的整段是 pathname(可能含空格) */
-        int fields = 0;
-        const char* t = line.c_str();
-        while (fields < 5) {
-            while (*t == ' ') ++t;
-            if (!*t) break;
-            t = strchr(t, ' ');
-            if (!t) break;
-            ++fields;
-        }
-        while (*t == ' ') ++t;
-        if (*t && strstr(t, keyword)) return true;
-        p = eol ? eol + 1 : nullptr;
-    }
-    return false;
-}
-
-void self_maps_paths(std::vector<std::string>& out) {
-    std::string s;
-    if (!read_small_file("/proc/self/maps", s)) return;
-    const char* p = s.c_str();
-    while (p && *p) {
-        const char* eol = strchr(p, '\n');
-        std::string line(p, eol ? eol - p : strlen(p));
-        int fields = 0;
-        const char* t = line.c_str();
-        while (fields < 5) {
-            while (*t == ' ') ++t;
-            if (!*t) break;
-            t = strchr(t, ' ');
-            if (!t) break;
-            ++fields;
-        }
-        while (*t == ' ') ++t;
-        if (*t) {
-            std::string path(t);
-            /* 去掉行尾 \r(理论无)与 "(deleted)" 尾巴,便于匹配 */
-            auto d = path.find(" (deleted)");
-            if (d != std::string::npos) path.erase(d);
-            if (std::find(out.begin(), out.end(), path) == out.end())
-                out.push_back(path);
-        }
-        p = eol ? eol + 1 : nullptr;
-    }
 }
 
 /* ================= 系统属性 ================= */

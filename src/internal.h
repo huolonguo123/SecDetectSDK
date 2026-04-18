@@ -94,19 +94,19 @@ bool read_small_file(const char* path, std::vector<uint8_t>& out); // 二进制
 /* 列目录(失败返回空);名字原样进 out,供调用方自己匹配 */
 void list_dir(const char* path, std::vector<std::string>& out);
 
-/* -- /proc/self/status -- */
-int  tracer_pid();                          // TracerPid 字段,0=没被附加
+/* -- /proc/<pid>/... 目标进程取证(pid<=0 = 自己) -- */
+/* 解析 input:"pid:1234" -> 1234;NULL/其它 -> 0(自己) */
+int target_pid(const char* input);
+int tracer_pid_of(int pid);                 // TracerPid 字段,0=没被附加
+std::string exe_of(int pid);                // readlink /proc/<pid>/exe
+std::string maps_of(int pid);               // maps 全文(读失败空串)
+bool maps_path_contains(int pid, const char* keyword); // 任一映射路径含 keyword
 
 /* -- /proc/net/tcp(含 tcp6):指定本地端口是否在 LISTEN -- */
 bool tcp_port_listening(uint16_t port);
 
 /* -- /proc/<pid>/cmdline 遍历:进程名含 keyword? -- */
 bool any_process_cmdline_contains(const char* keyword);
-
-/* -- /proc/self/maps:任一映射路径含 keyword? -- */
-bool self_maps_path_contains(const char* keyword);
-/* maps 里所有映射路径(去重)都塞进 out,供组合扫描 */
-void self_maps_paths(std::vector<std::string>& out);
 
 /* -- Android 系统属性(封装 __system_property_get) -- */
 std::string get_prop(const char* name);

@@ -28,8 +28,10 @@ public:
     const char* name() const override { return "frida"; }
     int type() const override { return DETECT_FRIDA; }
 
-    bool run(const char*, Findings& f) override {
+    bool run(const char* input, Findings& f) override {
         bool risk = false;
+        int pid = util::target_pid(input);   /* input="pid:N" 扫目标进程,空=自己 */
+        const char* who = (pid > 0) ? "frida[pid]:" : "frida:";
 
         /* A1:进程级驻留 */
         if (util::any_process_cmdline_contains("frida")) {
@@ -47,11 +49,11 @@ public:
             risk = true;
         }
 
-        /* B:注入自己进程的映射(命中=最直接证据) */
+        /* B:目标进程 maps 里的注入映射(命中=最直接证据) */
         static const char* kw[] = {"frida", "linjector", "gadget"};
         for (const char* k : kw) {
-            if (util::self_maps_path_contains(k)) {
-                f.add("maps: injected module contains '%s'", k);
+            if (util::maps_path_contains(pid, k)) {
+                f.add("%s maps: injected module contains '%s'", who, k);
                 risk = true;
             }
         }

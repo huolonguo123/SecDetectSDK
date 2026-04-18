@@ -65,16 +65,18 @@ const char* verdict_str(int r) {
 void usage() {
     printf("SecDetect SDK v%s — command-line runner\n", SECDETECT_VERSION);
     printf("usage:\n");
-    printf("  secdetect all [apk_path]        run all 9 checks "
+    printf("  secdetect all [apk_path]        run all 10 checks "
            "(pass apk to include repack)\n");
-    printf("  secdetect <name|1..9> [input]   run one check\n");
-    printf("  secdetect loop                  watch frida/debugger every 2s "
-           "(attach with frida to demo)\n");
+    printf("  secdetect <name|1..10> [input]  run one check\n");
+    printf("  secdetect loop [pid:N]          watch frida/debugger every 2s "
+           "(attach to self, or target pid:N)\n");
     printf("  secdetect tee                   show TEE backend status\n");
     printf("checks: ");
     for (const Item& it : kItems) printf("%s(%d) ", it.name, it.type);
     printf("\nrepack input: <apk_path>[,<baseline_sha256>]  "
            "(no baseline = calibration, prints fingerprint)\n");
+    printf("scan-other-process input for frida/debugger/xposed/vm/module: "
+           "pid:<pid>  (needs root; empty = self)\n");
 }
 
 }  // namespace
@@ -89,14 +91,25 @@ int main(int argc, char** argv) {
     printf("=== SecDetect SDK v%s ===  pid=%d euid=%d\n",
            SECDETECT_VERSION, (int)getpid(), (int)geteuid());
 
-    /* loop 模式:周期自检注入类风险,配合 frida -p attach 演示 */
+    /* loop 模式:周期自检注入类风险,配合 frida -p attach 演示;
+     * 可选参数 pid:<N> 让检测指向别的进程(需 root) */
     if (strcmp(argv[1], "loop") == 0) {
-        printf("loop: watching FRIDA/DEBUGGER every 2s; my pid=%d\n", (int)getpid());
-        printf("now attach me from host:  frida -H 127.0.0.1:39001 -p %d\n", (int)getpid());
+        const char* target = (argc >= 3) ? argv[2] : nullptr;
+        int tpid = 0;
+        if (target && strncmp(target, "pid:", 4) == 0) tpid = atoi(target + 4);
+        printf("loop: watching FRIDA/DEBUGGER every 2s; target=%s\n",
+               (tpid > 0) ? target : "self");
+        if (tpid > 0) {
+            printf("attach to that process from host:  "
+                   "frida -H 127.0.0.1:39001 -p %d\n", tpid);
+        } else {
+            printf("now attach me from host:  frida -H 127.0.0.1:39001 -p %d\n",
+                   (int)getpid());
+        }
         for (;;) {
             char o1[512] = {0}, o2[512] = {0};
-            int r1 = secdetect(DETECT_FRIDA, nullptr, o1, sizeof o1);
-            int r2 = secdetect(DETECT_DEBUGGER, nullptr, o2, sizeof o2);
+            int r1 = secdetect(DETECT_FRIDA, target, o1, sizeof o1);
+            int r2 = secdetect(DETECT_DEBUGGER, target, o2, sizeof o2);
             printf("t=%ld  frida=%d [%s]  debugger=%d [%s]\n",
                    (long)time(nullptr), r1, o1[0] ? o1 : "clean",
                    r2, o2[0] ? o2 : "clean");

@@ -26,8 +26,10 @@ public:
     const char* name() const override { return "xposed"; }
     int type() const override { return DETECT_XPOSED; }
 
-    bool run(const char*, Findings& f) override {
+    bool run(const char* input, Findings& f) override {
         bool risk = false;
+        int pid = util::target_pid(input);   /* input="pid:N" 扫目标进程,空=自己 */
+        const char* who = (pid > 0) ? "xposed[pid]:" : "xposed:";
 
         /* 1) 进程内注入:maps 映射名关键词 */
         static const char* kw[] = {
@@ -36,8 +38,8 @@ public:
             "dexposed",                   // 阿里开源的进程内 hook 框架
         };
         for (const char* k : kw) {
-            if (util::self_maps_path_contains(k)) {
-                f.add("maps: injected module '%s'", k);
+            if (util::maps_path_contains(pid, k)) {
+                f.add("%s maps: injected module '%s'", who, k);
                 risk = true;
             }
         }
