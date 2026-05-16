@@ -41,6 +41,7 @@ bool is_trusted_path(const std::string& p, const std::string& exe) {
         "/system/", "/apex/", "/vendor/", "/odm/", "/product/",
         "/data/dalvik-cache/",   /* boot.oat 等系统编译产物 */
         "/data/app/",            /* 已安装 App 的 lib/oat 加载点 */
+        "/dev/__properties__/",  /* bionic 属性共享内存(每进程必映射) */
     };
     for (const char* s : kTrusted)
         if (p.compare(0, strlen(s), s) == 0) return true;
