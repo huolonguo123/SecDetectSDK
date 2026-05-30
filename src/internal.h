@@ -100,6 +100,7 @@ int target_pid(const char* input);
 int tracer_pid_of(int pid);                 // TracerPid 字段,0=没被附加
 std::string exe_of(int pid);                // readlink /proc/<pid>/exe
 std::string maps_of(int pid);               // maps 全文(读失败空串)
+bool process_exists(int pid);               // /proc/<pid> 是否存在(pid<=0 恒真)
 bool maps_path_contains(int pid, const char* keyword); // 任一映射路径含 keyword
 
 /* -- /proc/net/tcp(含 tcp6):指定本地端口是否在 LISTEN -- */

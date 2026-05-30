@@ -107,6 +107,14 @@ std::string maps_of(int pid) {
     return s;
 }
 
+/* 目标进程是否存在(pid<=0 恒真:自己必然在) */
+bool process_exists(int pid) {
+    if (pid <= 0) return true;
+    char buf[64];
+    snprintf(buf, sizeof buf, "/proc/%d", pid);
+    return access(buf, F_OK) == 0;
+}
+
 bool maps_path_contains(int pid, const char* keyword) {
     std::string s = maps_of(pid);
     if (s.empty()) return false;

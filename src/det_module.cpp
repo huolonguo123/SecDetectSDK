@@ -61,8 +61,11 @@ public:
         int pid = util::target_pid(input);
         std::string maps = util::maps_of(pid);
         if (maps.empty()) {
-            f.add("module: cannot read maps for pid %d "
-                  "(need root to scan other processes)", pid);
+            if (pid > 0 && !util::process_exists(pid))
+                f.add("module: no such process pid %d", pid);
+            else
+                f.add("module: cannot read maps for pid %d "
+                      "(permission denied, need root)", pid);
             return false;
         }
         std::string exe = util::exe_of(pid);
