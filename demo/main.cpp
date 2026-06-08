@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <string>
 #include <unistd.h>
 
 namespace {
@@ -41,6 +42,7 @@ const Item kItems[] = {
     {DETECT_EMULATOR, "emulator"}, {DETECT_VM, "vm"},
     {DETECT_REPACK, "repack"},     {DETECT_BOOTLOADER, "bootloader"},
     {DETECT_USB_DEBUG, "usb_debug"}, {DETECT_MODULE, "module"},
+    {DETECT_INTEGRITY, "integrity"}, {DETECT_IDA, "ida"},
 };
 
 int parse_type(const char* s) {
@@ -49,7 +51,7 @@ int parse_type(const char* s) {
         if (strcmp(s, it.name) == 0) return it.type;
     char* end = nullptr;
     long v = strtol(s, &end, 10);
-    if (end && *end == '\0' && v >= 1 && v <= 10) return (int)v;
+    if (end && *end == '\0' && v >= 1 && v <= 12) return (int)v;
     return -1;
 }
 
@@ -65,24 +67,30 @@ const char* verdict_str(int r) {
 void usage() {
     printf("SecDetect SDK v%s — command-line runner\n", SECDETECT_VERSION);
     printf("usage:\n");
-    printf("  secdetect all [apk_path]        run all 10 checks "
+    printf("  secdetect all [apk_path]        run all 12 checks "
            "(pass apk to include repack)\n");
-    printf("  secdetect <name|1..10> [input]  run one check\n");
+    printf("  secdetect <name|1..12> [input]  run one check\n");
     printf("  secdetect loop [pid:N]          watch frida/debugger every 2s "
            "(attach to self, or target pid:N)\n");
+    printf("  secdetect env                   show Java/env facts currently set\n");
+    printf("  secdetect repack-auto <apk>[,<base>]  repack with input=NULL "
+           "(simulates App integration: path/baseline come from env facts)\n");
     printf("  secdetect tee                   show TEE backend status\n");
     printf("checks: ");
     for (const Item& it : kItems) printf("%s(%d) ", it.name, it.type);
-    printf("\nrepack input: <apk_path>[,<baseline_sha256>]  "
-           "(no baseline = calibration, prints fingerprint)\n");
-    printf("scan-other-process input for frida/debugger/xposed/vm/module: "
-           "pid:<pid>  (needs root; empty = self)\n");
+    printf("\nrepack input (optional): <apk_path>[,<md5|sha256>[|<more digests>]]  "
+           "(no baseline = calibration; omit entirely if Java fills SEC_FACT_APK_PATH)\n");
+    printf("multi-split apk: join paths with '|'  e.g. \"/data/app/x/base.apk|/data/app/x/split_config.arm64_v8a.apk\"\n");
+    printf("scan-other-process input for root/debugger/frida/xposed/vm/module/"
+           "integrity/ida/usb_debug/emulator: pid:<pid>  (needs root; empty = self)\n");
+    printf("env facts are filled by Java/JNI: secdetect_set_env_facts() — see "
+           "java/ and jni/\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    char out[2048];
+    char out[64 * 1024];   /* all 的单项证据可到 ~1.7KB;2048 会把后面的项整段截掉(真机实测) */
     /* adb shell 下 stdout 是块缓冲,先切成行缓冲,保证打印实时可见 */
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
@@ -123,6 +131,51 @@ int main(int argc, char** argv) {
         int r = secdetect_tee_attest(out, sizeof out);
         printf("tee_attest -> %d\n%s\n", r, out);
         return 0;
+    }
+
+    /* 环境事实(Java/JNI 回填了什么,一目了然) */
+    if (strcmp(argv[1], "env") == 0) {
+        sec_env_facts_t ef;
+        secdetect_get_env_facts(&ef);
+        printf("env facts provided mask = 0x%x\n", ef.provided);
+        printf("  usb_connected=%d adb_enabled=%d dev_options=%d mock_location=%d\n",
+               ef.usb_connected, ef.adb_enabled, ef.dev_options, ef.mock_location);
+        printf("  pkg_count_for_uid=%d sensor_count=%d bluetooth=%d hw_backed_key=%d\n",
+               ef.pkg_count_for_uid, ef.sensor_count, ef.bluetooth, ef.hw_backed_key);
+        printf("  gl_renderer=\"%s\"\n", ef.gl_renderer);
+        printf("  apk_path=\"%s\"\n", ef.apk_path);
+        printf("  apk_baseline=\"%s\"\n", ef.apk_baseline);
+        printf("  attest: verified_boot_state=%d device_locked=%d hash_ok=%d "
+               "sw_enforced=%d level=\"%s\" os=\"%s\"\n",
+               ef.att_verified_boot_state, ef.att_device_locked,
+               ef.att_verified_boot_hash_ok, ef.att_sw_enforced,
+               ef.att_security_level, ef.att_os_version);
+        return 0;
+    }
+
+    /* 模拟"App 集成形态":把 APK 路径/基线放进 env facts,再以 input=NULL 跑 repack。
+     * 用法: secdetect repack-auto <apk>[,<baseline>]
+     * 用途:证明 App 里 repack 项不需要再传 apk 路径(路径由 Java 回填)。 */
+    if (strcmp(argv[1], "repack-auto") == 0) {
+        if (argc < 3) { printf("usage: secdetect repack-auto <apk>[,<baseline>]\n"); return 2; }
+        sec_env_facts_t ef;
+        secdetect_get_env_facts(&ef);
+        std::string in(argv[2]);
+        size_t comma = in.find(',');
+        std::string apk = (comma == std::string::npos) ? in : in.substr(0, comma);
+        std::string base = (comma == std::string::npos) ? "" : in.substr(comma + 1);
+        snprintf(ef.apk_path, sizeof ef.apk_path, "%s", apk.c_str());
+        ef.provided |= SEC_FACT_APK_PATH;
+        if (!base.empty()) {
+            snprintf(ef.apk_baseline, sizeof ef.apk_baseline, "%s", base.c_str());
+            ef.provided |= SEC_FACT_APK_BASELINE;
+        }
+        secdetect_set_env_facts(&ef);
+        out[0] = '\0';
+        int r = secdetect(DETECT_REPACK, nullptr, out, sizeof out);   /* 注意 input = NULL */
+        printf("secdetect(REPACK, input=NULL) -> %s\n", verdict_str(r));
+        if (out[0]) printf("---- findings ----\n%s\n", out);
+        return r == SEC_ERR_PARAM ? 2 : r;
     }
 
     int type = parse_type(argv[1]);

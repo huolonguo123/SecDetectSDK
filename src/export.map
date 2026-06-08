@@ -1,6 +1,6 @@
 /* SecDetect 导出面白名单(version script)
  *
- * 把 .so 的动态符号表锁死成 4 个 C ABI 符号:
+ * 把 .so 的动态符号表锁死成这几个 C ABI 符号:
  *   - 逆向者拿到 so,导出表里只有检测入口,看不到任何内部实现符号;
  *   - 内部 C++ 类/工厂/工具函数即使有符号也全部 local,无法被 dlsym;
  *   - 附带好处:链接器可以对 local 符号做更多优化。
@@ -9,11 +9,16 @@
  * C++ 异常不跨 .so 边界传播(本 SDK 对外只有 C 接口,内部异常在
  * 库内消化),这就是安全的;集成方若要用 C++ 直接链本库并 catch
  * 库内异常,需去掉本文件。
+ *
+ * JNI 版本(libsecsdk-jni.so)用的是 jni/export_jni.map:
+ * JNI 入口必须导出,所以单独一份。
  */
-SECSDK_1.0 {
+SECSDK_1.1 {
     global:
         secdetect;
         secdetect_version;
+        secdetect_set_env_facts;
+        secdetect_get_env_facts;
         secdetect_tee_attest;
         secdetect_tee_set_backend;
     local:

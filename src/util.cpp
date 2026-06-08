@@ -7,15 +7,20 @@
 #include "internal.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <string>
+#include <vector>
 
 #ifdef HAVE_ZLIB
 #include <zlib.h>
@@ -196,7 +201,7 @@ bool any_process_cmdline_contains(const char* keyword) {
     while (!hit && (e = readdir(d)) != nullptr) {
         if (!is_pid_dir(e->d_name)) continue;
         if (strcmp(e->d_name, "self") == 0) continue;  // 自身不算
-        char path[64];
+        char path[300];
         snprintf(path, sizeof path, "/proc/%s/cmdline", e->d_name);
         std::string cmd;
         if (read_small_file(path, cmd) && !cmd.empty()) {
@@ -353,6 +358,56 @@ static bool has_suffix(const std::string& s, const char* suf) {
     return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
 }
 
+/* 解 ZIP 里的 deflate 数据。注意:ZIP 用的是**裸 deflate**(没有 zlib
+ * 的 2 字节头与 adler32 尾),所以不能用 uncompress(),必须
+ * inflateInit2(&strm, -MAX_WBITS)。(这一步以前用错 API,v1 签名
+ * 文件(默认 deflate 压缩)永远解不出来 —— 修于 v1.1.0。) */
+static bool inflate_raw(const uint8_t* src, size_t srclen, size_t expected,
+                        std::vector<uint8_t>& out) {
+#ifdef HAVE_ZLIB
+    z_stream zs;
+    memset(&zs, 0, sizeof zs);
+    if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return false;
+    zs.next_in = (Bytef*)src;
+    zs.avail_in = (uInt)srclen;
+
+    size_t cap = expected ? expected : 64 * 1024;
+    out.resize(cap);
+    zs.next_out = out.data();
+    zs.avail_out = (uInt)out.size();
+
+    int r = Z_OK;
+    while (true) {
+        r = inflate(&zs, Z_FINISH);
+        if (r == Z_STREAM_END) break;
+        if (r == Z_OK || r == Z_BUF_ERROR) {
+            if (zs.avail_out != 0) {           /* 输入耗尽但流没结束 → 坏数据 */
+                inflateEnd(&zs);
+                return false;
+            }
+            size_t used = out.size();
+            if (used > 64ULL * 1024 * 1024) {  /* 防解压炸弹 */
+                inflateEnd(&zs);
+                return false;
+            }
+            out.resize(used * 2);
+            zs.next_out = out.data() + used;
+            zs.avail_out = (uInt)(out.size() - used);
+            continue;
+        }
+        inflateEnd(&zs);
+        return false;
+    }
+    size_t total = zs.total_out;
+    inflateEnd(&zs);
+    out.resize(total);
+    return true;
+#else
+    (void)src; (void)srclen; (void)expected; (void)out;
+    return false;
+#endif
+}
+
 bool apk_first_signature(const char* apk_path, std::vector<uint8_t>& out) {
     FILE* fp = fopen(apk_path, "rb");
     if (!fp) return false;
@@ -378,13 +433,18 @@ bool apk_first_signature(const char* apk_path, std::vector<uint8_t>& out) {
     const uint8_t* eocd = &buf[(size_t)eocd_off];
     uint16_t total_entries = rd16(eocd + 10);
     uint32_t cd_offset     = rd32(eocd + 16);
+    uint32_t cd_size       = rd32(eocd + 12);
     if (total_entries == 0 || cd_offset >= (uint32_t)fsize) { fclose(fp); return false; }
 
-    /* --- 2. 遍历 Central Directory,找 META-INF 下的 .RSA/.DSA/.EC --- */
+    /* --- 2. 遍历 Central Directory,找 META-INF 下的 .RSA/.DSA/.EC ---
+     * 目录区大小以 EOCD 的 cd_size 为准(以前硬编码 64KB,
+     * 大 APK(几千个条目)的目录区会超,导致找不到签名文件) */
+    if (cd_size == 0 || cd_offset + cd_size > (uint32_t)fsize) cd_size = (uint32_t)(fsize - cd_offset);
+    if (cd_size > 8u * 1024 * 1024) cd_size = 8u * 1024 * 1024;   // 防呆上限 8MB
     std::vector<uint8_t> cd;
     fseek(fp, cd_offset, SEEK_SET);
-    cd.resize(64 * 1024);
-    size_t cd_read = fread(cd.data(), 1, cd.size(), fp);   // 目录区一般远小于 64KB
+    cd.resize(cd_size);
+    size_t cd_read = fread(cd.data(), 1, cd.size(), fp);
     size_t pos = 0;
     int found = -1;
     for (int e = 0; e < total_entries && pos + 46 <= cd_read; ++e) {
@@ -420,18 +480,9 @@ bool apk_first_signature(const char* apk_path, std::vector<uint8_t>& out) {
             if (method == 0) {                     // stored:原样
                 out = std::move(comp);
                 found = 0;
-            } else if (method == 8) {              // deflate:inflate
-#ifdef HAVE_ZLIB
+            } else if (method == 8) {              // deflate:裸 deflate 解压
                 if (usize > 4 * 1024 * 1024) break;   // 防恶意巨大声明
-                out.resize(usize ? usize : 1);
-                uLongf dl = usize;
-                int zr = uncompress(out.data(), &dl, comp.data(), (uLong)csize);
-                if (zr != Z_OK) break;
-                out.resize(dl);
-                found = 0;
-#else
-                (void)usize;
-#endif
+                if (inflate_raw(comp.data(), csize, usize, out)) found = 0;
             }
             break;   // 找到第一个签名块后不管成没成,退出循环
         }
@@ -461,6 +512,387 @@ bool hex_decode(const char* hex, std::vector<uint8_t>& out) {
         out.push_back((uint8_t)((hi << 4) | lo));
     }
     return true;
+}
+
+/* ====================================================================
+ * v1.1.0 追加:结构化分析原语(maps / 内存 / 线程 / 端口 / 属性 / sysfs)
+ * ==================================================================== */
+
+/* 读文件第一行(sysfs 节点常用) */
+std::string read_line_file(const char* path) {
+    FILE* fp = fopen(path, "r");
+    if (!fp) return std::string();
+    char line[256];
+    bool ok = fgets(line, sizeof line, fp) != nullptr;
+    fclose(fp);
+    if (!ok) return std::string();
+    size_t n = strlen(line);
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+    return std::string(line, n);
+}
+
+std::string proc_read(int pid, const char* leaf) {
+    std::string s;
+    read_small_file(proc_file(pid, leaf).c_str(), s);
+    return s;
+}
+
+/* maps 行:start-end perms offset dev inode pathname
+ * 用 sscanf 一次拿 4 个字段 + %n 记录已消费长度,剩下的就是 pathname
+ * (pathname 可含空格,不能按空格切)。 */
+bool parse_maps(int pid, std::vector<MapRegion>& out) {
+    std::string s = maps_of(pid);
+    if (s.empty()) return false;
+    const char* p = s.c_str();
+    while (p && *p) {
+        const char* eol = strchr(p, '\n');
+        std::string line(p, eol ? (size_t)(eol - p) : strlen(p));
+        p = eol ? eol + 1 : nullptr;
+
+        unsigned long long st = 0, en = 0, off = 0;
+        char perms[8] = {0};
+        int consumed = 0;
+        int got = sscanf(line.c_str(), "%llx-%llx %4s %llx %*s %*s%n",
+                         &st, &en, perms, &off, &consumed);
+        if (got < 4) continue;
+
+        MapRegion r;
+        r.start = st;
+        r.end = en;
+        r.off = off;
+        memcpy(r.perms, perms, 4);
+        r.perms[4] = '\0';
+        if (consumed > 0 && (size_t)consumed < line.size()) {
+            std::string path = line.substr((size_t)consumed);
+            size_t b = path.find_first_not_of(' ');
+            path = (b == std::string::npos) ? std::string() : path.substr(b);
+            size_t d = path.find(" (deleted)");
+            if (d != std::string::npos) {
+                r.deleted = true;       /* 保留标记:det_module/integrity 要分开处理 */
+                path.erase(d);
+            }
+            r.path = path;
+        }
+        out.push_back(std::move(r));
+    }
+    return !out.empty();
+}
+
+/* 读目标进程内存:/proc/<pid>/mem 的 pread。跨未映射页会短读/EIO,
+ * 调用方按"完整映射区间内"的块来读就不会踩到。 */
+bool read_proc_mem(int pid, uint64_t addr, void* buf, size_t len) {
+    std::string path = proc_file(pid, "mem");
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    uint8_t* dst = static_cast<uint8_t*>(buf);
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = pread(fd, dst + done, len - done, (off_t)(addr + done));
+        if (n <= 0) break;
+        done += (size_t)n;
+    }
+    close(fd);
+    return done == len;
+}
+
+void list_thread_comms(int pid, std::vector<std::string>& out) {
+    char dir[64];
+    if (pid <= 0) snprintf(dir, sizeof dir, "/proc/self/task");
+    else          snprintf(dir, sizeof dir, "/proc/%d/task", pid);
+    std::vector<std::string> tids;
+    list_dir(dir, tids);
+    for (const auto& t : tids) {
+        char p[96];
+        snprintf(p, sizeof p, "%s/%s/comm", dir, t.c_str());
+        std::string c = read_line_file(p);
+        if (!c.empty()) out.push_back(c);
+    }
+}
+
+/* 内存字符串扫描:逐映射、按块读,块间保留 needle-1 字节重叠,
+ * 这样跨块边界的特征串也能命中。总量由 max_bytes 兜底防卡死。
+ * 多特征版本:一遍内存里对窗口跑 N 次 memmem(魔改版要同时找
+ * 明文/base64/自定义特征,不能扫 N 遍全量内存)。 */
+/* 当前模块(我们自己所在的 .so/可执行文件)的路径。
+ * 为什么需要:内存特征扫描用的 needle 常量("frida:rpc" 之类)**本身就活在我们
+ * 自己的 .rodata 里**,而扫描会遍历所有可读映射 —— 不排除必然自命中。
+ * 实测(2026-09 宿主冒烟):扫自己 → 命中 "frida:rpc" @ 自己的二进制地址,
+ * 真机上就等于"每次跑都误报 frida"。所以按路径把自身模块整块跳过。 */
+static std::string own_module_path() {
+    static std::string cached;
+    if (!cached.empty()) return cached;
+    uintptr_t self = reinterpret_cast<uintptr_t>(reinterpret_cast<void*>(&own_module_path));
+    std::vector<MapRegion> maps;
+    if (!parse_maps(0, maps)) return cached;          /* 0 = 自己 */
+    for (const MapRegion& r : maps) {
+        if (self >= r.start && self < r.end) { cached = r.path; break; }
+    }
+    return cached;
+}
+
+/* 两个路径是否指向同一个模块(Android linker 可能给出相对名) */
+static bool same_module(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    if (a == b) return true;
+    size_t sa = a.find_last_of('/'), sb = b.find_last_of('/');
+    const char* na = (sa == std::string::npos) ? a.c_str() : a.c_str() + sa + 1;
+    const char* nb = (sb == std::string::npos) ? b.c_str() : b.c_str() + sb + 1;
+    return std::string(na) == std::string(nb);
+}
+
+bool mem_scan_any(int pid, const char* const* needles, size_t nneedles,
+                  uint64_t max_bytes, const char** hit, uint64_t* hit_addr,
+                  std::string* region) {
+    if (!needles || nneedles == 0) return false;
+    size_t maxlen = 1;
+    for (size_t i = 0; i < nneedles; ++i) {
+        if (!needles[i] || !*needles[i]) continue;
+        size_t l = strlen(needles[i]);
+        if (l > maxlen) maxlen = l;
+    }
+    std::vector<MapRegion> maps;
+    if (!parse_maps(pid, maps)) return false;
+    const std::string own = own_module_path();
+
+    uint64_t budget = max_bytes;
+    std::vector<uint8_t> tail, buf;
+    for (const MapRegion& r : maps) {
+        if (budget == 0) break;
+        if (!r.is_read() || r.end <= r.start) continue;
+        /* ★ 排除自身模块:needle 常量在那里,扫它 = 自己命中自己 */
+        if (!own.empty() && same_module(r.path, own)) continue;
+        uint64_t cap = std::min<uint64_t>(r.end - r.start, budget);
+        uint64_t va = r.start;
+        tail.clear();
+        while (va < r.start + cap) {
+            size_t want = (size_t)std::min<uint64_t>(64 * 1024, r.start + cap - va);
+            buf.resize(want);
+            if (read_proc_mem(pid, va, buf.data(), want)) {
+                std::vector<uint8_t> win;
+                win.reserve(tail.size() + want);
+                win.insert(win.end(), tail.begin(), tail.end());
+                win.insert(win.end(), buf.begin(), buf.end());
+                for (size_t i = 0; i < nneedles; ++i) {
+                    if (!needles[i] || !*needles[i]) continue;
+                    void* fp = memmem(win.data(), win.size(), needles[i], strlen(needles[i]));
+                    if (fp) {
+                        if (hit) *hit = needles[i];
+                        if (hit_addr)
+                            *hit_addr = va - tail.size() + (uint64_t)((uint8_t*)fp - win.data());
+                        if (region) *region = r.path;
+                        return true;
+                    }
+                }
+                if (maxlen > 1)
+                    tail.assign(win.end() - (maxlen - 1), win.end());
+                else
+                    tail.clear();
+            } else {
+                tail.clear();
+            }
+            budget -= (budget > want) ? want : budget;
+            va += want;
+        }
+    }
+    return false;
+}
+
+bool mem_scan_string(int pid, const char* needle, uint64_t max_bytes,
+                     uint64_t* hit_addr, std::string* region) {
+    const char* needles[1] = {needle};
+    return mem_scan_any(pid, needles, 1, max_bytes, nullptr, hit_addr, region);
+}
+
+/* ---------------- 监听端口 + 归属进程 ---------------- */
+
+static std::string cmdline_of_pid(const std::string& pid) {
+    std::string cmd = proc_read(atoi(pid.c_str()), "cmdline");
+    for (auto& c : cmd) if (c == '\0') c = ' ';
+    size_t e = cmd.find_last_not_of(' ');
+    if (e != std::string::npos) cmd.erase(e + 1);
+    return cmd;
+}
+
+/* 从 /proc/net/tcp{,6} 收 LISTEN 行的 inode,再遍历各进程的 fd 目录反查
+ * 归属进程。frida-server 随机端口、IDA 改端口都能靠这招抓到。 */
+void list_listening_ports(std::vector<ListenPort>& out) {
+    std::vector<std::pair<uint16_t, std::string>> listen_inodes;  // (port, inode)
+    for (const char* f : {"/proc/net/tcp", "/proc/net/tcp6"}) {
+        std::string s;
+        if (!read_small_file(f, s)) continue;
+        const char* p = s.c_str();
+        while (p && *p) {
+            const char* eol = strchr(p, '\n');
+            std::string line(p, eol ? (size_t)(eol - p) : strlen(p));
+            p = eol ? eol + 1 : nullptr;
+
+            /* 字段:sl local rem st tx:rx tr:tm retr uid timeout inode */
+            std::vector<std::string> tok;
+            size_t i = 0;
+            while (i < line.size() && tok.size() < 10) {
+                size_t b = line.find_first_not_of(" \t", i);
+                if (b == std::string::npos) break;
+                size_t e = line.find_first_of(" \t", b);
+                tok.push_back(line.substr(b, (e == std::string::npos) ? std::string::npos : e - b));
+                if (e == std::string::npos) break;
+                i = e;
+            }
+            if (tok.size() < 10) continue;
+            if (tok[3] != "0A") continue;                     /* 0A = LISTEN */
+            size_t colon = tok[1].rfind(':');
+            if (colon == std::string::npos) continue;
+            uint16_t port = (uint16_t)strtoul(tok[1].c_str() + colon + 1, nullptr, 16);
+            listen_inodes.emplace_back(port, tok[9]);
+        }
+    }
+    if (listen_inodes.empty()) return;
+
+    std::map<std::string, int> inode_pid;
+    DIR* d = opendir("/proc");
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (!is_pid_dir(e->d_name)) continue;
+        int pid = atoi(e->d_name);
+        std::string fd_dir = std::string("/proc/") + e->d_name + "/fd";
+        std::vector<std::string> fds;
+        list_dir(fd_dir.c_str(), fds);
+        for (const auto& fd : fds) {
+            char link[96];
+            snprintf(link, sizeof link, "%s/%s", fd_dir.c_str(), fd.c_str());
+            char tgt[128];
+            ssize_t n = readlink(link, tgt, sizeof(tgt) - 1);
+            if (n <= 0) continue;
+            tgt[n] = '\0';
+            if (strncmp(tgt, "socket:[", 8) != 0) continue;
+            std::string ino(tgt + 8);
+            size_t rb = ino.find(']');
+            if (rb != std::string::npos) ino.erase(rb);
+            inode_pid.emplace(ino, pid);
+        }
+    }
+    closedir(d);
+
+    for (const auto& li : listen_inodes) {
+        ListenPort lp;
+        lp.port = li.first;
+        auto it = inode_pid.find(li.second);
+        if (it != inode_pid.end()) {
+            lp.pid = it->second;
+            char pidstr[16];
+            snprintf(pidstr, sizeof pidstr, "%d", it->second);
+            lp.owner = cmdline_of_pid(pidstr);
+            if (lp.owner.empty()) {
+                char comm[16];
+                snprintf(comm, sizeof comm, "%d", it->second);
+                lp.owner = read_line_file((std::string("/proc/") + comm + "/comm").c_str());
+            }
+        }
+        out.push_back(std::move(lp));
+    }
+}
+
+void find_processes(const char* keyword, std::vector<ProcHit>& out, size_t max) {
+    if (!keyword || !*keyword) return;
+    DIR* d = opendir("/proc");
+    if (!d) return;
+    struct dirent* e;
+    while (out.size() < max && (e = readdir(d)) != nullptr) {
+        if (!is_pid_dir(e->d_name)) continue;
+        if (strcmp(e->d_name, "self") == 0) continue;
+        int pid = atoi(e->d_name);
+        if (pid == getpid()) continue;      /* 别把自己当成调试器/注入者 */
+        std::string base = std::string("/proc/") + e->d_name;
+        std::string cmd = proc_read(pid, "cmdline");
+        std::string comm = read_line_file((base + "/comm").c_str());
+        for (auto& c : cmd) if (c == '\0') c = ' ';
+        if (cmd.find(keyword) != std::string::npos ||
+            comm.find(keyword) != std::string::npos) {
+            ProcHit h;
+            h.pid = pid;
+            h.cmdline = cmd;
+            h.comm = comm;
+            out.push_back(std::move(h));
+        }
+    }
+    closedir(d);
+}
+
+/* ---------------- 系统属性枚举 ---------------- */
+
+namespace {
+struct PropSink {
+    std::vector<std::pair<std::string, std::string>>* out;
+    size_t max;
+};
+
+void prop_collect(const prop_info* pi, void* cookie) {
+    PropSink* sink = static_cast<PropSink*>(cookie);
+    if (!sink || sink->out->size() >= sink->max) return;
+    char name[PROP_NAME_MAX] = {0};
+    char value[PROP_VALUE_MAX] = {0};
+#if defined(__ANDROID_API__) && __ANDROID_API__ >= 26
+    struct Ctx {
+        PropSink* sink;
+        char* name;
+        char* value;
+    } ctx{sink, name, value};
+    __system_property_read_callback(
+        pi,
+        [](void* c, const char* n, const char* v, uint32_t) {
+            Ctx* x = static_cast<Ctx*>(c);
+            if (!x->name[0]) snprintf(x->name, PROP_NAME_MAX, "%s", n ? n : "");
+            if (!x->value[0] && v) snprintf(x->value, PROP_VALUE_MAX, "%s", v);
+            (void)x->sink;
+        },
+        &ctx);
+    if (!name[0]) return;
+    sink->out->emplace_back(name, value);
+#else
+    /* API < 26:__system_property_read 稳定可用(头里只是注释为 deprecated) */
+    if (__system_property_read(pi, name, value) < 0) return;
+    sink->out->emplace_back(name, value);
+#endif
+}
+}  // namespace
+
+void enumerate_props(std::vector<std::pair<std::string, std::string>>& out, size_t max) {
+    PropSink sink{&out, max};
+    __system_property_foreach(prop_collect, &sink);
+}
+
+/* ---------------- USB 物理连接(sysfs) ---------------- */
+
+/* 注意:"USB 调试开着" 与 "数据线插着" 是两回事。这里只看内核侧
+ * 是否有 USB 控制器处于 online/CONFIGURED(插了线/充电),不碰 adb
+ * 开关(那要 Java 的 Settings.Global.ADB_ENABLED / UsbManager)。 */
+int usb_physically_connected() {
+    int known = 0;
+    static const char* on[] = {
+        "/sys/class/power_supply/usb/online",
+        "/sys/class/power_supply/usb/present",
+        "/sys/class/power_supply/usb/connected",
+        "/sys/class/power_supply/usb/real_type",
+    };
+    for (const char* p : on) {
+        std::string v = read_line_file(p);
+        if (v.empty()) continue;
+        known = 1;
+        if (v == "1") return 1;
+    }
+    std::string st = read_line_file("/sys/class/android_usb/android0/state");
+    if (!st.empty()) {
+        known = 1;
+        if (st == "CONFIGURED" || st == "CONNECTED") return 1;
+    }
+    /* 有 USB 控制器设备节点也算插着(部分机型 power_supply 名字不同) */
+    if (path_exists("/sys/bus/usb/devices/usb1") ||
+        path_exists("/sys/class/udc")) {
+        std::string role = read_line_file("/sys/class/udc/fe800000.dwc3/state");
+        if (role == "configured" || role == "connected") return 1;
+        known = 1;
+    }
+    return known ? 0 : -1;
 }
 
 }  // namespace util
