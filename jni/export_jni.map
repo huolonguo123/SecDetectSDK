@@ -1,0 +1,22 @@
+/* SecDetect JNI 版导出面白名单
+ *
+ * 和 src/export.map 的区别:JNI 版本必须导出 JNI_OnLoad 与
+ * Java_* / 注册用的函数指针目标,否则 System.loadLibrary 后
+ * 找不到入口。除此之外仍然把内部 C++ 实现符号全部 local。
+ *
+ * 注意 RegisterNatives 用的是函数指针(native_detect 等在匿名
+ * namespace 里),那些函数本身不需要进 .dynsym;真正要导出的只有
+ * JNI_OnLoad。
+ */
+SECSDK_JNI_1.1 {
+    global:
+        JNI_OnLoad;
+        secdetect;
+        secdetect_version;
+        secdetect_set_env_facts;
+        secdetect_get_env_facts;
+        secdetect_tee_attest;
+        secdetect_tee_set_backend;
+    local:
+        *;
+};
